@@ -841,46 +841,113 @@ class HybridPlanner:
         goal: str,
         page_state: Dict[str, Any],
         history: List[Dict[str, Any]],
-        failures: List[Dict[str, Any]]
+        failures: List[Dict[str, Any]],
+        strategic_state: Optional[Dict[str, Any]] = None
     ) -> ActionDecision:
         """
-        Decide the next best action using hybrid strategy.
+        Decide the next best action using hybrid strategy with strategic awareness.
         
         Process:
-        1. Try deterministic rules (fast, reliable)
-        2. Fall back to LLM only if rules don't apply
-        3. Validate result before returning
+        1. Analyze strategic state for patterns (repeated failures, stuck conditions)
+        2. Try deterministic rules (fast, reliable)
+        3. Fall back to LLM only if rules don't apply
+        4. Validate result before returning
+        
+        Strategic Behaviors:
+        - If is_stuck == True: Strongly prefer exploration (scroll, navigate, different elements)
+        - If failure_rate > 0.5: Lower confidence, bias toward exploration, avoid finish
+        - If same action repeated 3 times: Force different action category
+        - If repeated_selector: Avoid that selector, try alternatives
         
         Args:
             goal: User goal description
             page_state: Current page state from PageAnalyzer
             history: Recent action history
             failures: Recent failures
+            strategic_state: Optional strategic analysis (failure patterns, stuck state)
             
         Returns:
             ActionDecision with next action to take
         """
         self._logger.info(f"Replanning next action for goal: {goal[:50]}...")
         
+        # Parse strategic state (if provided)
+        is_stuck = False
+        failure_rate = 0.0
+        repeated_selector = None
+        repeated_action = None
+        last_3_actions = []
+        
+        if strategic_state:
+            is_stuck = strategic_state.get("is_stuck", False)
+            failure_rate = strategic_state.get("failure_rate", 0.0)
+            repeated_selector = strategic_state.get("repeated_selector")
+            repeated_action = strategic_state.get("repeated_action")
+            last_3_actions = strategic_state.get("last_3_actions", [])
+            
+            self._logger.debug(
+                f"Strategic state: stuck={is_stuck}, failure_rate={failure_rate:.2f}, "
+                f"repeated_selector={repeated_selector}, repeated_action={repeated_action}"
+            )
+        
         try:
+            # ================================================================
+            # STRATEGIC OVERRIDE: If stuck, force exploration immediately
+            # ================================================================
+            if is_stuck:
+                self._logger.warning("Agent is stuck - forcing exploratory action")
+                
+                # Prefer scroll or navigation over clicking same things
+                # Check if scroll was recent
+                recent_scrolls = [a for a in last_3_actions if a == "scroll"]
+                
+                if len(recent_scrolls) >= 2:
+                    # Too many scrolls, try going back or searching
+                    self._logger.debug("Too many recent scrolls, suggesting navigation back")
+                    return ActionDecision(
+                        thought="Agent stuck after multiple scrolls, going back to try different path",
+                        action="navigate",
+                        target_selector=None,
+                        input_text="back",
+                        confidence=0.6,
+                        explanation="Strategic: Stuck condition - navigating back to explore alternatives"
+                    )
+                else:
+                    # Default stuck recovery: scroll to find new elements
+                    return ActionDecision(
+                        thought="Agent stuck, scrolling to discover new elements",
+                        action="scroll",
+                        target_selector=None,
+                        input_text="down",
+                        confidence=0.7,
+                        explanation="Strategic: Stuck condition - exploring page for alternative elements"
+                    )
+            
             # ================================================================
             # RULE 1: Check if goal is already satisfied
             # ================================================================
+            # STRATEGIC: Don't finish if failure rate is high (not confident in state)
             if self._goal_satisfied(goal, page_state):
-                self._logger.debug("Rule 1: Goal satisfied → finish")
-                return ActionDecision(
-                    thought="Goal appears to be satisfied on current page",
-                    action="finish",
-                    target_selector=None,
-                    input_text=None,
-                    confidence=0.9,
-                    explanation="Goal content found on page"
-                )
+                if failure_rate > 0.5:
+                    self._logger.warning(
+                        f"Goal appears satisfied but failure rate is high ({failure_rate:.2f}) - continuing exploration"
+                    )
+                    # Don't finish, continue exploring
+                else:
+                    self._logger.debug("Rule 1: Goal satisfied → finish")
+                    return ActionDecision(
+                        thought="Goal appears to be satisfied on current page",
+                        action="finish",
+                        target_selector=None,
+                        input_text=None,
+                        confidence=0.9,
+                        explanation="Goal content found on page"
+                    )
             
             # ================================================================
             # RULE 2: Check if same selector failed repeatedly
             # ================================================================
-            stuck_selector = self._recent_failures_on_same_selector(failures)
+            stuck_selector = repeated_selector or self._recent_failures_on_same_selector(failures)
             if stuck_selector:
                 self._logger.debug(f"Rule 2: Stuck on selector {stuck_selector} → scroll to find alternatives")
                 return ActionDecision(
@@ -889,63 +956,141 @@ class HybridPlanner:
                     target_selector=None,
                     input_text="down",
                     confidence=0.8,
-                    explanation="Previous attempts on same element failed, exploring page"
+                    explanation="Strategic: Avoiding repeated selector failure, exploring page"
                 )
+            
+            # ================================================================
+            # STRATEGIC: Check if same action repeated 3 times - force different category
+            # ================================================================
+            if last_3_actions and len(last_3_actions) >= 3:
+                if last_3_actions[-1] == last_3_actions[-2] == last_3_actions[-3]:
+                    repeated = last_3_actions[-1]
+                    self._logger.warning(f"Same action repeated 3 times: {repeated} - forcing alternative")
+                    
+                    # Choose different action category
+                    if repeated == "click":
+                        return ActionDecision(
+                            thought="Click repeated 3 times, trying scroll instead",
+                            action="scroll",
+                            target_selector=None,
+                            input_text="down",
+                            confidence=0.6,
+                            explanation="Strategic: Breaking repetition pattern by scrolling"
+                        )
+                    elif repeated == "scroll":
+                        # Find any clickable element
+                        best_match = self._find_best_matching_link(goal, page_state)
+                        if best_match:
+                            return ActionDecision(
+                                thought="Scroll repeated 3 times, trying click instead",
+                                action="click",
+                                target_selector=best_match["selector"],
+                                input_text=None,
+                                confidence=0.6,
+                                explanation="Strategic: Breaking scroll loop by clicking element"
+                            )
+                    elif repeated == "type":
+                        return ActionDecision(
+                            thought="Type repeated 3 times, trying scroll",
+                            action="scroll",
+                            target_selector=None,
+                            input_text="down",
+                            confidence=0.6,
+                            explanation="Strategic: Breaking type repetition by exploring"
+                        )
             
             # ================================================================
             # RULE 3: Find best matching link or button
             # ================================================================
             best_match = self._find_best_matching_link(goal, page_state)
+            
+            # STRATEGIC: Filter out repeated_selector if provided
+            if best_match and repeated_selector and best_match["selector"] == repeated_selector:
+                self._logger.debug(f"Best match is repeated selector {repeated_selector}, skipping")
+                best_match = None  # Force alternative
+            
             if best_match:
                 self._logger.debug(f"Rule 3: Found matching link/button: {best_match['text']}")
+                
+                # STRATEGIC: Lower confidence if high failure rate
+                confidence = 0.85
+                if failure_rate > 0.5:
+                    confidence = 0.65
+                    self._logger.debug(f"Lowering confidence due to high failure rate ({failure_rate:.2f})")
+                
                 return ActionDecision(
                     thought=f"Found element that matches goal: '{best_match['text']}'",
                     action="click",
                     target_selector=best_match["selector"],
                     input_text=None,
-                    confidence=0.85,
+                    confidence=confidence,
                     explanation=f"Clicking on '{best_match['text']}' which matches the goal"
                 )
             
             # ================================================================
             # RULE 4: If goal looks like a search query and search input exists
             # ================================================================
-            search_input = self._find_search_input(page_state.get("inputs", []))
-            if search_input and self._is_search_goal(goal):
-                search_term = self._extract_search_keywords(goal)
-                if search_term:
-                    self._logger.debug(f"Rule 4: Searching for '{search_term}' via search input")
-                    return ActionDecision(
-                        thought=f"Goal is a search query, found search input",
-                        action="type",
-                        target_selector=search_input["selector"],
-                        input_text=search_term,
-                        confidence=0.8,
-                        explanation=f"Typing search query into search box: '{search_term}'"
-                    )
+            # STRATEGIC: Avoid if 'type' action repeated multiple times
+            if repeated_action != "type":  # Only if type not failing repeatedly
+                search_input = self._find_search_input(page_state.get("inputs", []))
+                if search_input and self._is_search_goal(goal):
+                    search_term = self._extract_search_keywords(goal)
+                    if search_term:
+                        self._logger.debug(f"Rule 4: Searching for '{search_term}' via search input")
+                        
+                        # STRATEGIC: Lower confidence if high failure rate
+                        confidence = 0.8
+                        if failure_rate > 0.5:
+                            confidence = 0.6
+                        
+                        return ActionDecision(
+                            thought=f"Goal is a search query, found search input",
+                            action="type",
+                            target_selector=search_input["selector"],
+                            input_text=search_term,
+                            confidence=confidence,
+                            explanation=f"Typing search query into search box: '{search_term}'"
+                        )
             
             # ================================================================
             # RULE 5: If page is long and goal not satisfied, scroll
             # ================================================================
-            if self._page_is_long(page_state):
-                # Check if we haven't scrolled recently
-                recent_scrolls = [h for h in history[-5:] if h.get("action") == "scroll"]
-                if len(recent_scrolls) < 2:  # Only if few scrolls in history
-                    self._logger.debug("Rule 5: Page is long and goal unsatisfied → scroll")
-                    return ActionDecision(
-                        thought="Page is long and goal not satisfied yet, scrolling to explore",
-                        action="scroll",
-                        target_selector=None,
-                        input_text="down",
-                        confidence=0.7,
-                        explanation="Scrolling down to find relevant content"
-                    )
+            # STRATEGIC: Only if not scrolling repeatedly
+            if repeated_action != "scroll":  # Avoid if scroll is failing
+                if self._page_is_long(page_state):
+                    # Check if we haven't scrolled recently
+                    recent_scrolls = [h for h in history[-5:] if h.get("decision", {}).get("action") == "scroll"]
+                    if len(recent_scrolls) < 2:  # Only if few scrolls in history
+                        self._logger.debug("Rule 5: Page is long and goal unsatisfied → scroll")
+                        
+                        # STRATEGIC: Lower confidence if high failure rate
+                        confidence = 0.7
+                        if failure_rate > 0.5:
+                            confidence = 0.5
+                        
+                        return ActionDecision(
+                            thought="Page is long and goal not satisfied yet, scrolling to explore",
+                            action="scroll",
+                            target_selector=None,
+                            input_text="down",
+                            confidence=confidence,
+                            explanation="Scrolling down to find relevant content"
+                        )
             
             # ================================================================
             # FALLBACK: Use LLM for complex decision
             # ================================================================
             self._logger.debug("No deterministic rule applied → using LLM fallback")
             decision = await self._llm_decision(goal, page_state, history, failures)
+            
+            # STRATEGIC: Adjust LLM decision confidence based on failure rate
+            if failure_rate > 0.5:
+                original_confidence = decision.confidence
+                decision.confidence = min(original_confidence * 0.8, 0.7)  # Cap at 0.7
+                self._logger.debug(
+                    f"Adjusted LLM confidence due to high failure rate: "
+                    f"{original_confidence:.2f} → {decision.confidence:.2f}"
+                )
             
             # Validate before returning
             decision = self._validate_and_correct_decision(decision, page_state)
@@ -973,9 +1118,11 @@ class HybridPlanner:
         """
         Check if goal is already satisfied on current page.
         
-        Heuristics:
+        PRODUCTION FIX: Enhanced heuristics with semantic signals:
         - Goal keywords appear in page text
         - Page title/headings contain satisfaction keywords
+        - Content density suggests informational completeness
+        - URL patterns suggest goal-relevant page
         
         Args:
             goal: User goal
@@ -988,23 +1135,67 @@ class HybridPlanner:
         text_lower = page_state.get("main_text_summary", "").lower()
         title_lower = page_state.get("title", "").lower()
         headings_lower = " ".join(page_state.get("headings", [])).lower()
+        url_lower = page_state.get("url", "").lower()
+        
+        # PRODUCTION FIX: Check URL patterns for goal-relevant pages
+        url_indicators = {
+            "course": ["course", "learn", "tutorial", "class", "training"],
+            "product": ["product", "item", "details", "shop"],
+            "article": ["article", "post", "blog", "news"],
+            "result": ["search", "results", "query"],
+        }
+        
+        goal_type = None
+        for gtype, patterns in url_indicators.items():
+            if any(p in goal_lower for p in patterns):
+                goal_type = gtype
+                break
+        
+        # If URL matches goal type, stronger signal
+        url_match = False
+        if goal_type:
+            url_match = any(p in url_lower for p in url_indicators[goal_type])
         
         # Check satisfaction keywords
         text_combined = f"{text_lower} {title_lower} {headings_lower}"
         
+        satisfaction_found = False
         for keyword in self.SATISFACTION_KEYWORDS:
             if keyword in text_combined:
                 self._logger.debug(f"Satisfaction keyword found: {keyword}")
-                return True
+                satisfaction_found = True
+                break
         
-        # Check if goal keywords appear multiple times in text (indicator of relevance)
+        # PRODUCTION FIX: Check if goal keywords appear with sufficient density
         goal_keywords = self._extract_keywords(goal)
         matches = sum(1 for kw in goal_keywords if kw in text_lower)
+        keyword_density = matches / len(goal_keywords) if goal_keywords else 0
         
-        if matches >= len(goal_keywords) * 0.7:  # 70% of keywords present
-            self._logger.debug(f"Goal keywords found in page ({matches}/{len(goal_keywords)})")
+        # PRODUCTION FIX: Content density check (prevents premature finish on sparse pages)
+        text_length = len(page_state.get("main_text_summary", ""))
+        has_substantial_content = text_length > 400  # At least 400 chars
+        
+        # Require ALL conditions for confident satisfaction:
+        # 1. High keyword density (80%+ of goal words present)
+        # 2. Substantial content (not a loading/error page)
+        # 3. EITHER satisfaction keywords OR URL match
+        if keyword_density >= 0.8 and has_substantial_content:
+            if satisfaction_found or url_match:
+                self._logger.info(
+                    f"Goal likely satisfied: keyword_density={keyword_density:.2f}, "
+                    f"content_length={text_length}, url_match={url_match}"
+                )
+                return True
+        
+        # PRODUCTION FIX: Secondary check - if keyword density is very high (90%+) alone
+        if keyword_density >= 0.9 and text_length > 600:
+            self._logger.info(f"Goal likely satisfied: high keyword density ({keyword_density:.2f})")
             return True
         
+        self._logger.debug(
+            f"Goal not satisfied: keyword_density={keyword_density:.2f}, "
+            f"content_length={text_length}, satisfaction_found={satisfaction_found}"
+        )
         return False
     
     def _find_best_matching_link(self, goal: str, page_state: Dict[str, Any]) -> Optional[Dict[str, str]]:

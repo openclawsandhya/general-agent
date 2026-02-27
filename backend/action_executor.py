@@ -170,10 +170,52 @@ class ActionExecutor:
         last_error = None
         for attempt in range(CLICK_RETRY_ATTEMPTS):
             try:
+                # PRODUCTION FIX: Try selector with fallback strategies
+                element_found = False
+                
+                # Strategy 1: Direct selector
+                try:
+                    await asyncio.wait_for(
+                        page.wait_for_selector(selector, state="visible", timeout=2.0),
+                        timeout=2.5
+                    )
+                    element_found = True
+                except:
+                    self._logger.debug(f"Direct selector failed: {selector}, trying fallback")
+                
+                # Strategy 2: Try text-based fallback if direct selector fails
+                if not element_found and attempt == 0:
+                    # Extract text from selector if it's an ID or class
+                    if "#" in selector or "." in selector:
+                        # Try finding by visible text containing selector hint
+                        try:
+                            await asyncio.wait_for(
+                                page.wait_for_selector(f"text={selector.replace('#', '').replace('.', '')[:20]}", timeout=1.0),
+                                timeout=1.5
+                            )
+                            selector = f"text={selector.replace('#', '').replace('.', '')[:20]}"
+                            element_found = True
+                            self._logger.info(f"Fallback text selector worked: {selector}")
+                        except:
+                            pass
+                
+                if not element_found:
+                    raise Exception(f"Element not visible: {selector}")
+                
                 await asyncio.wait_for(
                     page.click(selector),
                     timeout=ACTION_TIMEOUT
                 )
+                
+                # PRODUCTION FIX: Wait for network to settle after click navigation
+                try:
+                    await asyncio.wait_for(
+                        page.wait_for_load_state("networkidle"),
+                        timeout=3.0  # 3s max wait for networkidle
+                    )
+                except asyncio.TimeoutError:
+                    self._logger.warning(f"Click succeeded but networkidle timeout: {selector}")
+                    # Continue anyway - page may have loaded enough
                 
                 self._logger.info(f"Click succeeded: {selector}")
                 return {
@@ -451,11 +493,14 @@ class ActionExecutor:
                     page.go_back(),
                     timeout=ACTION_TIMEOUT
                 )
-                # Wait for page to load after navigation
-                await asyncio.wait_for(
-                    page.wait_for_load_state("domcontentloaded"),
-                    timeout=ACTION_TIMEOUT
-                )
+                # PRODUCTION FIX: Wait for networkidle, not just domcontentloaded
+                try:
+                    await asyncio.wait_for(
+                        page.wait_for_load_state("networkidle"),
+                        timeout=5.0  # 5s for back navigation
+                    )
+                except asyncio.TimeoutError:
+                    self._logger.warning("Navigate back: networkidle timeout, proceeding")
                 details = "Navigated back"
             else:
                 # Treat as URL
@@ -463,11 +508,14 @@ class ActionExecutor:
                     page.goto(target),
                     timeout=ACTION_TIMEOUT
                 )
-                # Wait for page to load after navigation
-                await asyncio.wait_for(
-                    page.wait_for_load_state("domcontentloaded"),
-                    timeout=ACTION_TIMEOUT
-                )
+                # PRODUCTION FIX: Wait for networkidle, not just domcontentloaded
+                try:
+                    await asyncio.wait_for(
+                        page.wait_for_load_state("networkidle"),
+                        timeout=5.0  # 5s for goto navigation
+                    )
+                except asyncio.TimeoutError:
+                    self._logger.warning(f"Navigate to {target}: networkidle timeout, proceeding")
                 details = f"Navigated to {target}"
             
             self._logger.info(f"Navigate succeeded: {target}")
