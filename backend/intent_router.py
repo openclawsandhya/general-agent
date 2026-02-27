@@ -4,7 +4,7 @@ Intent router to classify user messages as chat or automation.
 
 import re
 from typing import Tuple
-from models.schemas import IntentType
+from .models.schemas import IntentType
 from .utils.logger import get_logger
 
 

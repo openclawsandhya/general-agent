@@ -17,7 +17,7 @@ from typing import Callable, List, Optional, Dict, Any
 from datetime import datetime
 from dataclasses import dataclass, field
 
-from models.schemas import ActionPlan, ActionStep, ActionType
+from .models.schemas import ActionPlan, ActionStep, ActionType
 from .browser_controller import BrowserController
 from .executor import Executor
 from .llm_client import LLMClient
@@ -330,7 +330,7 @@ What are the NEXT STEPS to take toward the goal?
 Return JSON with 'steps' array and 'reasoning' string."""
 
         try:
-            response = self.llm.generate_response(
+            response = self.llm.generate_response_sync(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.4,
@@ -419,7 +419,7 @@ CURRENT BROWSER STATE:
 Is the goal achieved? Answer only with 'yes' or 'no'."""
 
         try:
-            response = self.llm.generate_response(
+            response = self.llm.generate_response_sync(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.1,  # Low temperature for consistency
@@ -514,7 +514,7 @@ Is the goal achieved? Answer only with 'yes' or 'no'."""
             if step.description:
                 descriptions.append(step.description)
             else:
-                action_name = step.action.value.replace("_", " ").title()
+                action_name = step.action.replace("_", " ").title()
                 if step.value:
                     descriptions.append(f"{action_name}: {step.value}")
                 else:

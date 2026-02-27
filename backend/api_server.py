@@ -11,26 +11,43 @@ The orchestrator internally decides routing based on intent detection.
 
 Author: Agent System
 Date: 2026-02-25
-Version: 1.0.0
+Version: 2.0.0
 """
 
+import os
 import asyncio
 import uuid
 import json
+import time
 from typing import Optional
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+from .config import settings
 from .llm_client import LLMClient
 from .planner import Planner
 from .browser_controller import BrowserController
 from .executor import Executor
 from .agent_controller import AutonomousAgentController
 from .orchestrator import AgentOrchestrator
+from .tools import registry as tool_registry
+from .tools.browser import make_browser_tools
+from .session_manager import BrowserSessionManager, get_session
+from .tools.filesystem import make_filesystem_tools
+from .tools.code_runner import make_code_tools
+from .tools.web_research import make_web_tools
 from .utils.logger import get_logger
+
+# Backward-compat alias used in health endpoint / shutdown
+BrowserSingleton = BrowserSessionManager
 
 
 logger = get_logger(__name__)
@@ -80,7 +97,13 @@ class HealthResponse(BaseModel):
     """Health check response."""
     status: str
     llm_available: bool
+    model: str           # backward compat alias for llm_model
+    llm_model: str
+    llm_base_url: str
+    model_loaded: bool
     orchestrator_ready: bool
+    browser_ready: bool
+    timestamp: str
 
 
 # ============================================================================
@@ -96,9 +119,11 @@ orchestrators: dict = {}
 # ============================================================================
 
 app = FastAPI(
-    title="Trial Automation Agent - Production API",
-    description="Unified agent API with chat, controlled automation, and autonomous goal execution",
-    version="2.0.0"
+    title="SANDHYA.AI - Autonomous Agent API",
+    description="Fully autonomous general-purpose execution agent — browser, filesystem, code, and web research tools",
+    version="3.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # Add CORS middleware for frontend integration
@@ -112,6 +137,30 @@ app.add_middleware(
 
 
 # ============================================================================
+# Global Exception Handler
+# ============================================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Global exception handler for unhandled errors.
+    
+    Returns structured JSON error response.
+    """
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "message": str(exc),
+            "path": str(request.url),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    )
+
+
+# ============================================================================
 # Initialization
 # ============================================================================
 
@@ -119,41 +168,54 @@ app.add_middleware(
 async def startup_event():
     """Initialize all components on server startup."""
     logger.info("=" * 70)
-    logger.info("AGENT SERVER STARTUP")
+    logger.info("SANDHYA.AI AGENT SERVER STARTUP")
     logger.info("=" * 70)
 
     try:
-        # Initialize LLM client
+        # Initialize LLM client with settings from .env
         logger.info("[1/5] Initializing LLM client...")
+        logger.info(f"  Base URL: {settings.LLM_BASE_URL}")
+        logger.info(f"  Model: {settings.LLM_MODEL}")
+        
         llm_client = LLMClient(
-            base_url="http://localhost:1234/v1",
-            model="mistral-7b-instruct"
+            base_url=settings.LLM_BASE_URL,
+            model=settings.LLM_MODEL,
+            timeout=settings.LLM_TIMEOUT
         )
 
         # Check LLM health
-        llm_health = llm_client.health_check()
-        if not llm_health:
+        health = llm_client.health_check()
+        if not health["available"]:
             logger.warning(
-                "⚠️  LM Studio not detected at http://localhost:1234. "
+                f"⚠️  LM Studio not detected at {settings.LLM_BASE_URL}. "
+                f"Error: {health.get('error', 'Unknown')}. "
                 "Chat and planning will not work. Ensure LM Studio is running."
             )
+        elif not health["model_loaded"]:
+            logger.warning(
+                f"⚠️  Model '{settings.LLM_MODEL}' not loaded in LM Studio. "
+                "Please load the model in LM Studio."
+            )
         else:
-            logger.info("✓ LLM client ready")
+            logger.info(f"[OK] LLM client ready - Model '{settings.LLM_MODEL}' loaded")
 
         # Initialize browser controller
         logger.info("[2/5] Initializing browser controller...")
-        browser_controller = BrowserController(headless=True)
-        logger.info("✓ Browser controller initialized")
+        browser_controller = BrowserController(
+            headless=settings.BROWSER_HEADLESS,
+            timeout_ms=settings.BROWSER_TIMEOUT_MS
+        )
+        logger.info("[OK] Browser controller initialized")
 
         # Initialize planner
         logger.info("[3/5] Initializing planner...")
         planner = Planner(llm_client)
-        logger.info("✓ Planner initialized")
+        logger.info("[OK] Planner initialized")
 
         # Initialize executor
         logger.info("[4/5] Initializing executor...")
         executor = Executor(browser_controller)
-        logger.info("✓ Executor initialized")
+        logger.info("[OK] Executor initialized")
 
         # Initialize autonomous agent controller
         logger.info("[5/5] Initializing autonomous agent controller...")
@@ -163,7 +225,7 @@ async def startup_event():
             llm_client=llm_client,
             max_iterations=10
         )
-        logger.info("✓ Autonomous controller initialized")
+        logger.info("[OK] Autonomous controller initialized")
 
         # Store in app state for later access
         app.state.llm_client = llm_client
@@ -172,8 +234,20 @@ async def startup_event():
         app.state.executor = executor
         app.state.autonomous_controller = autonomous_controller
 
+        # Register tools into the global ToolRegistry
+        logger.info("[+] Registering tools into ToolRegistry...")
+        for name, fn in make_browser_tools(browser_controller).items():
+            tool_registry.register(name, fn)
+        for name, fn in make_filesystem_tools().items():
+            tool_registry.register(name, fn)
+        for name, fn in make_code_tools().items():
+            tool_registry.register(name, fn)
+        for name, fn in make_web_tools().items():
+            tool_registry.register(name, fn)
+        logger.info(f"[OK] Tools registered: {tool_registry.available()}")
+
         logger.info("=" * 70)
-        logger.info("✓ SERVER STARTUP COMPLETE - ALL SYSTEMS READY")
+        logger.info("[OK] SERVER STARTUP COMPLETE - ALL SYSTEMS READY")
         logger.info("=" * 70)
 
     except Exception as e:
@@ -187,11 +261,17 @@ async def shutdown_event():
     logger.info("Server shutting down...")
 
     try:
+        # Stop the persistent browser session (via BrowserSessionManager)
+        await get_session().stop()
+        logger.info("BrowserSessionManager stopped")
+    except Exception as e:
+        logger.error(f"Shutdown error (BrowserSessionManager): {e}")
+
+    try:
         if hasattr(app.state, 'browser_controller'):
             await app.state.browser_controller.stop()
-            logger.info("Browser stopped")
     except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+        logger.error(f"Shutdown error (legacy browser_controller): {e}")
 
     logger.info("Server shutdown complete")
 
@@ -249,17 +329,33 @@ def _format_sse(event_type: str, content: str, is_final: bool = False) -> str:
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """
-    Health check endpoint.
+    Health check endpoint with comprehensive status.
+    
+    Verifies:
+    - LLM server reachability
+    - Configured model availability
+    - Orchestrator initialization
     
     Returns:
-        Health status of all components
+        Detailed health status
     """
-    llm_health = app.state.llm_client.health_check()
+    health_data = app.state.llm_client.health_check()
+
+    status = "healthy" if health_data["available"] and health_data["model_loaded"] else "degraded"
+
+    bc = getattr(app.state, "browser_controller", None)
+    browser_ready = get_session().is_ready
 
     return HealthResponse(
-        status="healthy",
-        llm_available=llm_health,
-        orchestrator_ready=True
+        status=status,
+        llm_available=health_data["available"],
+        model=health_data["model_name"],
+        llm_model=health_data["model_name"],
+        llm_base_url=app.state.llm_client.base_url,
+        model_loaded=health_data.get("model_loaded", False),
+        orchestrator_ready=True,
+        browser_ready=browser_ready,
+        timestamp=datetime.utcnow().isoformat() + "Z"
     )
 
 
@@ -288,6 +384,7 @@ async def message_endpoint(request: AgentMessageRequest) -> AgentMessageResponse
     Raises:
         HTTPException: On processing errors
     """
+    start_time = time.time()
     message = request.message.strip()
     session_id = request.session_id or str(uuid.uuid4())
 
@@ -305,8 +402,10 @@ async def message_endpoint(request: AgentMessageRequest) -> AgentMessageResponse
 
         # Determine mode used
         mode = orchestrator.current_mode.value
+        
+        execution_time = time.time() - start_time
 
-        logger.info(f"[{session_id}] Mode: {mode}, Reply length: {len(reply)}")
+        logger.info(f"[{session_id}] \u2713 Mode: {mode}, Reply: {len(reply)} chars, Time: {execution_time:.2f}s")
 
         return AgentMessageResponse(
             reply=reply,
@@ -315,11 +414,16 @@ async def message_endpoint(request: AgentMessageRequest) -> AgentMessageResponse
         )
 
     except Exception as e:
-        logger.error(f"[{session_id}] Error: {str(e)}", exc_info=True)
-        return AgentMessageResponse(
-            reply="Sorry, I encountered an error processing your request. Please try again.",
-            session_id=session_id,
-            mode="error"
+        execution_time = time.time() - start_time
+        logger.error(f"[{session_id}] \u2717 Error after {execution_time:.2f}s: {str(e)}", exc_info=True)
+        
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Internal server error",
+                "message": str(e),
+                "session_id": session_id
+            }
         )
 
 

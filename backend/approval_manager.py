@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime
 
-from models.schemas import ActionPlan, ActionStep, ActionType
+from .models.schemas import ActionPlan, ActionStep, ActionType
 from .chat_responder import ChatResponder
 from .llm_client import LLMClient
 from .utils.logger import get_logger
@@ -431,7 +431,7 @@ class ApprovalManager:
             # Build step descriptions
             steps = []
             for step in plan.steps[:5]:  # Limit to 5 steps
-                description = step.description or str(step.action.value)
+                description = step.description or str(step.action)
                 steps.append(f"• {description}")
             
             explanation = (

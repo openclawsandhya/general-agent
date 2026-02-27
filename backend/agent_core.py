@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from models.schemas import ActionPlan, IntentType
+from .models.schemas import ActionPlan, IntentType
 from .llm_client import LLMClient
 from .planner import Planner
 from .executor import Executor
@@ -402,7 +402,7 @@ class AutomationAgent:
                 lines.append(f"{i}. {step.description}")
             else:
                 # Fallback if no description
-                action_name = step.action.value.replace("_", " ").title()
+                action_name = step.action.replace("_", " ").title()
                 if step.value:
                     lines.append(f"{i}. {action_name}: {step.value}")
                 else:
@@ -532,7 +532,7 @@ class AutomationAgent:
             return None
         
         steps_list = "\n".join(
-            f"  • {step.description or step.action.value}"
+            f"  • {step.description or step.action}"
             for step in self.pending_plan.steps
         )
         

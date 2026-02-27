@@ -4,6 +4,7 @@ Action planner that converts user requests into structured automation plans.
 This module includes:
 - Planner: Multi-step plan generation from user goals
 - AutonomousPlanner: Single-action decision making based on page state
+- GoalPlanner: SANDHYA.AI autonomous goal planner (full tool suite)
 """
 
 import json
@@ -14,8 +15,9 @@ from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime
 
-from models.schemas import ActionPlan, ActionStep, ActionType
+from .models.schemas import ActionPlan, ActionStep, ActionType, GoalStep, GoalPlan
 from .llm_client import LLMClient
+from .system_prompt import SANDHYA_SYSTEM_PROMPT
 from .utils.logger import get_logger
 
 
@@ -119,7 +121,7 @@ IMPORTANT: Return ONLY valid JSON, no other text. Example:
 Return valid JSON with 'steps' array and 'reasoning' string."""
         
         try:
-            response = self.llm_client.generate_response(
+            response = self.llm_client.generate_response_sync(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.3,
@@ -527,7 +529,7 @@ Return STRICT JSON (no other text):
         """
         for attempt in range(self.MAX_RETRIES):
             try:
-                response = self.llm_client.generate_response(
+                response = self.llm_client.generate_response_sync(
                     prompt=prompt,
                     temperature=self.DECISION_TEMPERATURE,
                     max_tokens=512
@@ -1602,7 +1604,7 @@ Remember:
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: self.llm_client.generate_response(
+            lambda: self.llm_client.generate_response_sync(
                 prompt=prompt,
                 temperature=self.LLM_TEMPERATURE,
                 max_tokens=self.LLM_MAX_TOKENS
@@ -1731,3 +1733,216 @@ Remember:
             confidence=0.3,
             explanation="Using safe scroll fallback"
         )
+
+
+# ============================================================================
+# GoalPlanner — SANDHYA.AI master planner
+# ============================================================================
+
+class GoalPlanner:
+    """
+    Converts high-level user goals into structured GoalPlan objects.
+
+    Uses SANDHYA_SYSTEM_PROMPT to instruct the LLM to return a JSON plan
+    covering all tool categories (browser, filesystem, code, web research).
+
+    Supports:
+      - async generate(goal, history=[])   — primary interface
+      - re-planning given previous results — for autonomous loop
+    """
+
+    def __init__(self, llm_client: LLMClient):
+        self.llm = llm_client
+        logger.info("[GoalPlanner] Initialized")
+
+    async def generate(
+        self,
+        goal: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        context: Optional[str] = None,
+    ) -> GoalPlan:
+        """
+        Generate a GoalPlan for the given user goal.
+
+        Args:
+            goal:    User's natural-language goal.
+            history: Optional prior conversation turns [{"role":"user","content":"..."}].
+            context: Optional previous execution context / results for re-planning.
+
+        Returns:
+            GoalPlan with mode, goal, plan steps, and message.
+        """
+        logger.info(f"[GoalPlanner] Generating plan for: {goal[:80]!r}")
+
+        user_content = goal
+        if context:
+            user_content = (
+                f"{goal}\n\n"
+                f"[Previous execution context — use to continue or correct the plan]\n"
+                f"{context}"
+            )
+
+        try:
+            raw = await self.llm.generate_response(
+                prompt=user_content,
+                system_prompt=SANDHYA_SYSTEM_PROMPT,
+                temperature=0.2,
+                max_tokens=600,
+            )
+
+            logger.debug(f"[GoalPlanner] Raw response: {raw[:400]!r}")
+
+            if raw.startswith("LLM_ERROR"):
+                logger.warning(f"[GoalPlanner] LLM error: {raw}")
+                return self._chat_fallback(goal, raw)
+
+            plan = self._parse_plan(raw, goal)
+            logger.info(
+                f"[GoalPlanner] mode={plan.mode} | steps={len(plan.plan)} | "
+                f"goal={plan.goal[:60]!r}"
+            )
+            return plan
+
+        except Exception as e:
+            logger.error(f"[GoalPlanner] Exception: {e}", exc_info=True)
+            return self._chat_fallback(goal, str(e))
+
+    def _parse_plan(self, raw: str, original_goal: str) -> GoalPlan:
+        """Parse LLM JSON response into a GoalPlan.
+
+        Supports two output shapes:
+          NEW: {mode, goal, message, deliberation:{planner_plan,critic_feedback,refined_plan}, final_plan:{goal,steps:[...]}}
+          LEGACY: {mode, goal, message, plan:[...]}
+        """
+        data = self._extract_json(raw)
+
+        if data is None:
+            logger.warning("[GoalPlanner] Could not parse JSON plan")
+            return GoalPlan(
+                mode="chat",
+                goal=original_goal,
+                plan=[],
+                message=raw.strip()[:500] if raw.strip() else "I'm ready to help.",
+            )
+
+        mode = str(data.get("mode", "chat")).lower()
+        goal = str(data.get("goal", original_goal))
+        message = str(data.get("message", ""))
+
+        # ── NEW format: final_plan.steps takes priority ──────────────────────
+        raw_steps: list = []
+        deliberation: Optional[dict] = None
+
+        final_plan = data.get("final_plan")
+        if isinstance(final_plan, dict):
+            raw_steps = final_plan.get("steps", []) or []
+            if not isinstance(raw_steps, list):
+                raw_steps = []
+            # override goal from final_plan if more specific
+            if final_plan.get("goal"):
+                goal = str(final_plan["goal"])
+
+        # ── LEGACY format fallback ────────────────────────────────────────────
+        if not raw_steps:
+            raw_steps = data.get("plan", []) or []
+            if not isinstance(raw_steps, list):
+                raw_steps = []
+
+        # ── Extract deliberation payload ──────────────────────────────────────
+        delib = data.get("deliberation")
+        if isinstance(delib, dict):
+            deliberation = {
+                "planner_plan": delib.get("planner_plan", []),
+                "critic_feedback": delib.get("critic_feedback", ""),
+                "refined_plan": delib.get("refined_plan", []),
+            }
+            logger.debug(
+                f"[GoalPlanner] deliberation captured | "
+                f"planner_steps={len(deliberation['planner_plan'])} | "
+                f"critic={str(deliberation['critic_feedback'])[:80]!r}"
+            )
+
+        steps = []
+        for item in raw_steps:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action", "")).strip()
+            if not action:
+                continue
+            params = item.get("parameters", {})
+            if not isinstance(params, dict):
+                params = {}
+            steps.append(GoalStep(
+                step=int(item.get("step", len(steps) + 1)),
+                action=action,
+                parameters=params,
+                description=item.get("description"),
+            ))
+
+        return GoalPlan(
+            mode=mode,
+            goal=goal,
+            plan=steps,
+            message=message,
+            deliberation=deliberation,
+        )
+
+    def _extract_json(self, text: str) -> Optional[dict]:
+        """Extract first valid JSON object from text."""
+        # Strip markdown fences
+        text = re.sub(r"```(?:json)?", "", text).strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        # Find first {...}
+        for m in re.finditer(r'\{.*\}', text, re.DOTALL):
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    def _chat_fallback(self, goal: str, error_detail: str) -> GoalPlan:
+        """Return a safe chat-mode fallback when LLM fails."""
+        return GoalPlan(
+            mode="chat",
+            goal=goal,
+            plan=[],
+            message=f"I encountered an issue generating a plan: {error_detail[:200]}",
+        )
+
+    async def plan(self, goal: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Single-call deliberative planning via SANDHYA_SYSTEM_PROMPT.
+
+        The system prompt already encodes the full Planner → Critic → Refiner
+        → Execution Strategist reasoning chain, so a single LLM call produces
+        the complete deliberation + final_plan JSON.
+
+        Args:
+            goal:    User's natural-language goal.
+            context: Optional dict of additional context (previous results, memory, etc.).
+
+        Returns:
+            Raw JSON string from the LLM — structure is NOT altered.
+            On LLM failure, returns an ``LLM_ERROR:`` prefixed string.
+        """
+        context = context or {}
+
+        prompt = f"""
+{SANDHYA_SYSTEM_PROMPT}
+
+User Goal:
+{goal}
+
+Context:
+{context}
+
+Return ONLY valid JSON.
+"""
+
+        logger.info(f"[GoalPlanner.plan] Single-call deliberation for: {goal[:80]!r}")
+        response = await self.llm.complete(prompt)
+        logger.debug(f"[GoalPlanner.plan] Raw response: {response[:300]!r}")
+        return response

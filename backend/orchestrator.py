@@ -20,16 +20,22 @@ Date: 2026-02-25
 Version: 1.0.0
 """
 
+import json
 import logging
+import traceback
+import uuid
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from enum import Enum
 
-from models.schemas import ActionPlan, ExecutionReport, StreamingMessage
+from .models.schemas import ActionPlan, ExecutionReport, StreamingMessage
 from .llm_client import LLMClient
-from .planner import Planner
-from .executor import Executor
+from .planner import Planner, GoalPlanner
+from .executor import Executor, AutonomousGoalExecutor
 from .agent_controller import AutonomousAgentController
+from .validation_agent import ValidationAgent
+from .memory import MemoryManager
+from .tools import registry as tool_registry
 
 
 # ============================================================================
@@ -118,25 +124,32 @@ class AgentOrchestrator:
         llm_client: LLMClient,
         autonomous_controller: AutonomousAgentController,
         session_id: str = None,
+        goal_planner: Optional[GoalPlanner] = None,
     ):
         """
         Initialize the orchestrator with required components.
-        
+
         Args:
             planner: Planner instance for action plan generation
             executor: Executor instance for step execution
             llm_client: LLMClient instance for LLM interactions
             autonomous_controller: AutonomousAgentController for autonomous mode
             session_id: Optional session identifier for logging/tracking
+            goal_planner: GoalPlanner for SANDHYA.AI full-tool autonomous mode
         """
         self.planner = planner
         self.executor = executor
         self.llm_client = llm_client
         self.autonomous_controller = autonomous_controller
 
+        # SANDHYA.AI full-tool autonomous components
+        self.goal_planner: GoalPlanner = goal_planner or GoalPlanner(llm_client)
+        self.validation_agent: ValidationAgent = ValidationAgent(llm_client)
+
         # Conversation state
         self.conversation_history: List[Dict[str, Any]] = []
         self.pending_plan: Optional[ActionPlan] = None
+        self.pending_goal_plan = None          # GoalPlan for new ToolRegistry path
         self.last_observation: Optional[Dict[str, Any]] = None
         self.executed_steps_memory: List[str] = []
 
@@ -255,26 +268,26 @@ class AgentOrchestrator:
             intent = self.detect_intent(message)
             self.current_mode = intent
 
-        # Log intent detection result
-        self._log("debug", f"Intent detection result: {intent.value}")
-        
-        if intent == IntentMode.CHAT:
-            self._log("debug", "Routing to chat mode")
-            return await self._handle_chat_mode(message)
+            # Log intent detection result
+            self._log("info", f"[Orchestrator] mode={intent.value} | msg={message[:60]!r}")
 
-        elif intent == IntentMode.CONTROLLED_AUTOMATION:
-            self._log("debug", "Routing to controlled automation mode")
-            return await self._handle_controlled_automation_mode(message)
-
-        elif intent == IntentMode.AUTONOMOUS_GOAL:
-            self._log("debug", "Routing to autonomous goal mode")
+            if intent == IntentMode.CHAT:
+                self._log("debug", "Routing to chat mode")
                 return await self._handle_chat_mode(message)
+
+            elif intent == IntentMode.CONTROLLED_AUTOMATION:
+                self._log("debug", "Routing to controlled automation mode")
+                return await self._handle_controlled_automation_mode(message)
+
+            elif intent == IntentMode.AUTONOMOUS_GOAL:
+                self._log("debug", "Routing to autonomous goal mode")
+                return await self._handle_autonomous_goal_mode(message)
 
         except Exception as e:
             self._log("error", f"Error in handle_message: {str(e)}")
             return (
-                f"I encountered an error processing your request: {str(e)}. "
-                "Please try rephrasing or report this issue."
+                "I'm experiencing temporary local inference delay. "
+                "Mixtral is running on CPU - please retry in a moment."
             )
 
     # ========================================================================
@@ -296,19 +309,34 @@ class AgentOrchestrator:
         """
         self._log("info", "Entering CHAT mode")
 
-        # Build context from recent conversation history
-        context_messages = self.conversation_history[-6:]  # Last 3 turns
-        context_str = "\n".join(
-            [f"{m['role']}: {m['content']}" for m in context_messages]
-        )
+        # Build context from recent conversation history (last 6 messages = 3 turns)
+        context_messages = self.conversation_history[-6:]
 
         # Generate response
         try:
-            response = self.llm_client.generate_response(
-                prompt=f"Conversation context:\n{context_str}\n\n"
-                f"Respond naturally and helpfully to the user.",
-                temperature=0.7,
+            # Format messages for LLM — phi-3.1-mini supports system role natively
+            llm_messages = [
+                {"role": "system", "content": "You are SANDHYA.AI, a helpful autonomous AI assistant. Respond naturally and concisely."}
+            ]
+
+            # Add recent conversation context
+            for msg in context_messages:
+                llm_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+
+            # Async call — proper for async context, never blocks the event loop
+            self._log("debug",
+                f"[Chat] → LLM | model={self.llm_client.model} | "
+                f"msgs={len(llm_messages)} | max_tokens=256"
             )
+            response = await self.llm_client.generate_response(
+                messages=llm_messages,
+                temperature=0.7,
+                max_tokens=256,
+            )
+            self._log("debug", f"[Chat] ← LLM | chars={len(response)} | preview={response[:100]!r}")
 
             # Record assistant response
             self.conversation_history.append({
@@ -322,11 +350,9 @@ class AgentOrchestrator:
             return response
 
         except Exception as e:
-            self._log("error", f"Chat generation failed: {str(e)}")
-            return (
-                "I'm having trouble generating a response right now. "
-                "Please try again."
-            )
+            self._log("error", f"Chat generation failed: {type(e).__name__}: {str(e)}")
+            self._log("debug", traceback.format_exc())
+            return f"LLM_ERROR: {type(e).__name__}: {str(e)}"
 
     # ========================================================================
     # Controlled Automation Mode
@@ -335,52 +361,46 @@ class AgentOrchestrator:
     async def _handle_controlled_automation_mode(self, message: str) -> str:
         """
         Handle controlled automation with human approval.
-        
-        Flow:
-          1. Generate action plan
-          2. Validate plan (safety checks)
-          3. Request user approval
-          4. Store pending plan for approval handling
-        
-        Args:
-            message: User message describing the automation task
-            
-        Returns:
-            Human-readable plan explanation requesting approval
+
+        Uses GoalPlanner → GoalPlan → AutonomousGoalExecutor path so all
+        browser actions go through the hardened ToolRegistry / BrowserSingleton.
         """
-        self._log("info", "Entering CONTROLLED_AUTOMATION mode")
+        self._log("info", "Entering CONTROLLED_AUTOMATION mode (GoalPlanner path)")
 
         try:
-            # Generate plan
-            self._log("debug", "Generating action plan...")
-            plan = self.planner.generate_plan(message)
+            goal_plan = await self.goal_planner.generate(message)
 
-            # Log generated plan details
-            if plan and plan.steps:
-                self._log("debug", f"Generated plan with {len(plan.steps)} steps:")
-                for i, step in enumerate(plan.steps):
-                    self._log("debug", f"  Step {i+1}: {step.action.value} - {step.description or 'N/A'}")
-            
-            # Validate plan
-            validation_error = self._validate_plan(plan)
-            if validation_error:
-                self._log("warning", f"Plan validation failed: {validation_error}")
-                return validation_error
+            if goal_plan.mode == "chat" or not goal_plan.plan:
+                # Planner decided no automation needed → just reply
+                return goal_plan.message or "No automation steps needed for this request."
 
-            # Store pending plan
-            self.pending_plan = plan
+            # Store GoalPlan as pending
+            self.pending_goal_plan = goal_plan
+            self.pending_plan = None        # clear legacy plan
             self._approval_pending = True
-            self._log("debug", "Plan stored as pending, awaiting approval...")
 
-            # Generate human-readable explanation
-            explanation = self._plan_to_explanation(message, plan)
+            # Build approval prompt (include deliberation if present)
+            steps_text = "\n".join(
+                f"  {s.step}. {s.action}: {json.dumps(s.parameters)}"
+                for s in goal_plan.plan
+            )
 
-            self._log("info", "Plan generated and awaiting approval")
+            critic_section = ""
+            if goal_plan.deliberation and goal_plan.deliberation.get("critic_feedback"):
+                critic_section = (
+                    f"\nCritic review: {goal_plan.deliberation['critic_feedback']}\n"
+                )
 
-            return explanation
+            return (
+                f"I can help with that. Here's my plan:\n\n"
+                f"{steps_text}\n"
+                f"{critic_section}\n"
+                f"Goal: {goal_plan.goal}\n\n"
+                f"Does this look right? Reply with 'yes' to proceed or 'no' to cancel."
+            )
 
         except Exception as e:
-            self._log("error", f"Failed to generate plan: {str(e)}")
+            self._log("error", f"Failed to generate plan: {e}")
             return (
                 "I encountered an error creating an automation plan. "
                 "Please refine your request and try again."
@@ -435,7 +455,7 @@ class AgentOrchestrator:
             Human-readable explanation requesting approval
         """
         steps_text = "\n".join(
-            [f"  {i + 1}. {step.action.value}: {step.description or ''}"
+            [f"  {i + 1}. {step.action}: {step.description or ''}"
              for i, step in enumerate(plan.steps)]
         )
 
@@ -473,7 +493,7 @@ class AgentOrchestrator:
         """
         self._log("info", "Processing approval response")
 
-        if not self.pending_plan:
+        if not self.pending_plan and not self.pending_goal_plan:
             self._log("warning", "Approval request received but no pending plan")
             return "I don't have a pending plan to execute."
 
@@ -493,6 +513,7 @@ class AgentOrchestrator:
                 self._log("info", "Plan rejected by user")
                 self._log("debug", "Approval decision: REJECTED - cancelling execution")
                 self.pending_plan = None
+                self.pending_goal_plan = None
                 self._approval_pending = False
                 return "Understood. Execution cancelled as per your request."
 
@@ -506,62 +527,83 @@ class AgentOrchestrator:
         except Exception as e:
             self._log("error", f"Error in approval handling: {str(e)}")
             self.pending_plan = None
+            self.pending_goal_plan = None
             self._approval_pending = False
             return f"An error occurred: {str(e)}"
 
     async def _execute_approved_plan(self) -> str:
         """
-        Execute the approved plan with conversational updates.
-        
-        Returns:
-            Detailed execution report in conversational format
+        Execute the approved plan through ToolRegistry (new path).
+
+        Works with:
+          - pending_goal_plan (GoalPlan) → AutonomousGoalExecutor + ToolRegistry
+          - pending_plan (ActionPlan) fallback → legacy Executor (backward compat)
         """
         self._log("info", "Executing approved plan")
 
         try:
-            # Reset memory for this execution
             self.executed_steps_memory = []
 
-            # Execute plan
-            execution_report = await self.executor.execute(self.pending_plan)
+            # ── New GoalPlan path (ToolRegistry + BrowserSingleton) ──────────
+            if self.pending_goal_plan is not None:
+                goal_plan = self.pending_goal_plan
+                self.pending_goal_plan = None
+                self._approval_pending = False
 
-            # Store observation and results
-            self.last_observation = {
-                "timestamp": datetime.now().isoformat(),
-                "steps_executed": len(execution_report.executed_steps if execution_report.executed_steps else []),
-                "success_count": len([s for s in (execution_report.executed_steps or []) if s.get("success")]),
-            }
+                import uuid as _uuid
+                task_id = str(_uuid.uuid4())[:8]
+                memory = MemoryManager(self._session_id)
+                memory.start_task(task_id, goal_plan.goal, "controlled")
 
-            # Record in history
-            self.conversation_history.append({
-                "timestamp": datetime.now().isoformat(),
-                "role": "assistant",
-                "content": f"Executed plan with {len(execution_report.executed_steps or [])} steps",
-                "mode": "controlled_automation",
-                "report": execution_report.dict() if execution_report else {},
-            })
+                exec_ = AutonomousGoalExecutor(
+                    tool_registry=tool_registry,
+                    memory_manager=memory,
+                )
+                exec_.set_status_callback(lambda m: self._log("info", f"[Exec] {m}"))
 
-            # Clear pending plan
-            self.pending_plan = None
-            self._approval_pending = False
+                step_results = await exec_.execute_plan(goal_plan)
+                memory.complete_task("controlled execution complete", iterations=1)
 
-            # Generate conversational report
-            report_text = self._execution_report_to_conversation(execution_report)
-            self._log("info", "Plan execution completed")
-            self._log("debug", f"Execution report: {len(execution_report.executed_steps or [])} steps executed")
+                successes = sum(1 for r in step_results if r["success"])
+                failures  = len(step_results) - successes
 
-            return report_text
+                lines = []
+                for r in step_results:
+                    icon = "✓" if r["success"] else "✗"
+                    lines.append(f"  {icon} Step {r['step']}: {r['action']} → {r['result'][:80]}")
+
+                status_line = (
+                    f"✓ All {len(step_results)} steps completed!"
+                    if failures == 0
+                    else f"⚠ {successes}/{len(step_results)} steps succeeded, {failures} failed."
+                )
+
+                self.conversation_history.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "role": "assistant",
+                    "content": status_line,
+                    "mode": "controlled_automation",
+                })
+                self._log("info", f"Controlled execution done: {status_line}")
+                return f"{status_line}\n\nDetails:\n" + "\n".join(lines)
+
+            # ── Legacy ActionPlan path (backward compat) ─────────────────────
+            elif self.pending_plan is not None:
+                execution_report = await self.executor.execute(self.pending_plan)
+                self.pending_plan = None
+                self._approval_pending = False
+                return self._execution_report_to_conversation(execution_report)
+
+            else:
+                self._approval_pending = False
+                return "No pending plan to execute."
 
         except Exception as e:
-            self._log("error", f"Plan execution failed: {str(e)}")
-            self._log("debug", "Approval status: Pending plan cleared due to execution failure")
+            self._log("error", f"Plan execution failed: {e}", exc_info=True)
+            self.pending_goal_plan = None
             self.pending_plan = None
             self._approval_pending = False
-            # Return graceful fallback message
-            return (
-                "I couldn't complete that action on this page. "
-                "Would you like me to try a different approach?"
-            )
+            return f"Execution error: {type(e).__name__}: {e}"
 
     def _execution_report_to_conversation(self, report: ExecutionReport) -> str:
         """
@@ -653,40 +695,120 @@ class AgentOrchestrator:
 
     async def _safe_autonomous_execution(self, goal: str) -> str:
         """
-        Execute autonomous goal with strict safety enforcement.
-        
-        Safety mechanisms:
-          1. Max iterations check
-          2. Step deduplication
-          3. Loop detection
-          4. Navigation drift detection
-          5. Graceful fallback on errors
-        
-        Args:
-            goal: Goal description
-            
+        SANDHYA.AI full-tool autonomous execution loop.
+
+        Flow for each iteration:
+          1. GoalPlanner generates a structured plan (all tool categories)
+          2. AutonomousGoalExecutor runs all steps using ToolRegistry
+          3. ValidationAgent checks if goal is achieved
+          4. If incomplete and next_plan provided → re-plan and repeat
+          5. Stop at MAX_ITERATIONS or when goal is validated complete
+
         Returns:
-            Execution result as conversation
+            Human-readable result string.
         """
-        self._log("debug", "Starting safe autonomous execution")
+        self._log("info", "[SANDHYA] Starting full-tool autonomous execution")
+
+        task_id = str(uuid.uuid4())[:8]
+        memory = MemoryManager(self._session_id)
+        memory.start_task(task_id, goal, "autonomous")
+
+        executor = AutonomousGoalExecutor(
+            tool_registry=tool_registry,
+            memory_manager=memory,
+        )
+        executor.set_status_callback(lambda msg: self._log("info", f"[Executor] {msg}"))
+
+        MAX_ITER = 5
+        iteration = 0
+        context_for_replan: Optional[str] = None
+        final_reply = f"Working on: {goal}"
 
         try:
-            # Delegate to autonomous controller
-            result = await self.autonomous_controller.run_goal(goal)
+            while iteration < MAX_ITER:
+                iteration += 1
+                self._log("info", f"[SANDHYA] Iteration {iteration}/{MAX_ITER}")
 
-            # Parse result for safety validation
-            if "max iterations" in result.lower() or "loop detected" in result.lower():
-                self._log("warning", "Safety limit reached during autonomous execution")
+                # ── 1. Plan ────────────────────────────────────────────────
+                plan = await self.goal_planner.generate(
+                    goal=goal,
+                    context=context_for_replan,
+                )
+                self._log("info",
+                    f"[SANDHYA] Plan: mode={plan.mode} | steps={len(plan.plan)} | "
+                    f"msg={plan.message[:80]!r}"
+                )
 
-            return result
+                # Chat mode → no execution needed
+                if plan.mode == "chat" or not plan.plan:
+                    final_reply = plan.message or "Goal resolved without execution steps."
+                    break
+
+                # ── 2. Execute ─────────────────────────────────────────────
+                step_results = await executor.execute_plan(plan)
+
+                successes = sum(1 for r in step_results if r["success"])
+                failures = len(step_results) - successes
+                self._log("info",
+                    f"[SANDHYA] Execution done: {successes} ok / {failures} failed"
+                )
+
+                # ── 3. Validate ────────────────────────────────────────────
+                validation = await self.validation_agent.validate(
+                    goal=goal,
+                    steps_summary=memory.steps_summary(),
+                    results_summary=memory.results_summary(),
+                )
+
+                self._log("info",
+                    f"[SANDHYA] Validation: completed={validation.completed} "
+                    f"pct={validation.completion_pct} | {validation.reason[:80]!r}"
+                )
+
+                if validation.completed:
+                    final_reply = (
+                        f"✓ Goal achieved: {goal}\n\n"
+                        f"{validation.reason}\n\n"
+                        f"Completed in {iteration} iteration(s), "
+                        f"{len(memory.steps)} steps total."
+                    )
+                    break
+
+                # Not complete — prepare context for re-planning
+                if validation.needs_continuation:
+                    context_for_replan = (
+                        f"Previous steps:\n{memory.steps_summary()}\n\n"
+                        f"Results so far:\n{memory.results_summary()}\n\n"
+                        f"Validation says: {validation.reason}\n"
+                        f"Missing: {', '.join(validation.missing_steps)}"
+                    )
+                    # Override plan with validated next steps on next iteration
+                    self._log("info",
+                        f"[SANDHYA] Continuing with {len(validation.next_plan)} more steps"
+                    )
+                else:
+                    # No continuation possible
+                    final_reply = (
+                        f"Partial completion ({validation.completion_pct}%): {goal}\n\n"
+                        f"{validation.reason}"
+                    )
+                    break
+
+            else:
+                # Hit iteration limit
+                final_reply = (
+                    f"Reached iteration limit ({MAX_ITER}) for goal: {goal}\n\n"
+                    f"Progress so far:\n{memory.steps_summary()}"
+                )
 
         except Exception as e:
-            self._log("error", f"Autonomous execution error: {str(e)}")
-            return (
-                "I encountered a limitation while working autonomously on this goal. "
-                "This might be due to complexity or safety constraints. "
-                "Please try a more specific request or use controlled automation instead."
-            )
+            self._log("error", f"[SANDHYA] Autonomous execution error: {e}", exc_info=True)
+            final_reply = f"LLM_ERROR: {type(e).__name__}: {e}"
+
+        finally:
+            memory.complete_task(final_reply, iterations=iteration)
+
+        return final_reply
 
     # ========================================================================
     # Safety Utilities

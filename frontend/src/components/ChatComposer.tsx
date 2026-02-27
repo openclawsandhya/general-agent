@@ -1,13 +1,17 @@
 import { useState, useRef, useEffect } from "react";
 import { Send, Paperclip, Mic, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { sendMessage } from "@/lib/api";
+import { toast } from "sonner";
 
 interface ComposerProps {
-  onSend: (message: string) => void;
+  onSend: (message: string, reply: string, mode: string) => void;
   isLoading: boolean;
+  setIsLoading: (loading: boolean) => void;
+  sessionId?: string;
 }
 
-export function ChatComposer({ onSend, isLoading }: ComposerProps) {
+export function ChatComposer({ onSend, isLoading, setIsLoading, sessionId }: ComposerProps) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -18,10 +22,39 @@ export function ChatComposer({ onSend, isLoading }: ComposerProps) {
     }
   }, [value]);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!value.trim() || isLoading) return;
-    onSend(value.trim());
+    
+    const message = value.trim();
     setValue("");
+    setIsLoading(true);
+
+    try {
+      console.log("[ChatComposer] Sending message to backend...");
+      const response = await sendMessage(message, sessionId);
+      console.log("[ChatComposer] Response received:", response);
+      
+      onSend(message, response.reply, response.mode);
+      
+      // Show success toast with mode
+      toast.success(`Response received (${response.mode} mode)`);
+      
+    } catch (error) {
+      console.error("[ChatComposer] Error:", error);
+      
+      // Show error toast
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+      toast.error(`Failed to send message: ${errorMessage}`);
+      
+      // Still call onSend with error message so user sees something
+      onSend(
+        message,
+        `❌ Error: ${errorMessage}\n\nPlease ensure:\n1. Backend server is running (http://localhost:8000)\n2. LM Studio is running with Mixtral model loaded\n3. No network issues`,
+        "error"
+      );
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

@@ -1,22 +1,59 @@
-import { useState } from "react";
-import { ChevronRight, ChevronLeft } from "lucide-react";
+import { useState, useEffect } from "react";
+import { ChevronRight, ChevronLeft, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { checkHealth, type HealthResponse } from "@/lib/api";
 
-const timelineSteps = [
-  { step: 1, action: "Initialize session", status: "success" as const, time: "00:00.12" },
-  { step: 2, action: "Parse user intent", status: "success" as const, time: "00:01.34" },
-  { step: 3, action: "Query knowledge base", status: "success" as const, time: "00:02.89" },
-  { step: 4, action: "Generate response", status: "running" as const, time: "00:04.12" },
-];
+interface TelemetryPanelProps {
+  currentMode?: string;
+  stepsTaken?: number;
+  lastAction?: string;
+}
 
-const statusColors: Record<string, string> = {
-  success: "status-success",
-  failed: "status-failed",
-  running: "status-running",
-};
-
-export function TelemetryPanel() {
+export function TelemetryPanel({ currentMode = "chat", stepsTaken = 0, lastAction = "None" }: TelemetryPanelProps) {
   const [open, setOpen] = useState(true);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchHealthStatus = async () => {
+    setLoading(true);
+    setError(null);
+    
+    try {
+      const healthData = await checkHealth();
+      setHealth(healthData);
+      console.log("[Telemetry] Health status:", healthData);
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : "Failed to connect";
+      setError(errorMsg);
+      console.error("[Telemetry] Health check failed:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // Initial fetch
+    fetchHealthStatus();
+
+    // Poll every 5 seconds
+    const interval = setInterval(fetchHealthStatus, 5000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  const getStatusColor = (available: boolean) => {
+    return available ? "text-green-500" : "text-red-500";
+  };
+
+  const getStatusDot = (available: boolean) => {
+    return (
+      <span className={cn(
+        "w-2 h-2 rounded-full inline-block mr-2",
+        available ? "bg-green-500 animate-pulse" : "bg-red-500"
+      )} />
+    );
+  };
 
   return (
     <>
@@ -38,56 +75,121 @@ export function TelemetryPanel() {
       >
         {open && (
           <div className="p-4 space-y-6">
-            {/* Agent Status */}
+            {/* System Status Header */}
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                System Status
+              </h3>
+              <button
+                onClick={fetchHealthStatus}
+                disabled={loading}
+                className="p-1 rounded hover:bg-muted transition-colors"
+                title="Refresh status"
+              >
+                <RefreshCw className={cn("w-3 h-3", loading && "animate-spin")} />
+              </button>
+            </div>
+
+            {/* Backend Health */}
             <div>
-              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Agent Status</h3>
+              <h4 className="text-xs font-medium text-foreground mb-3">Backend</h4>
               <div className="space-y-2.5">
-                {[
-                  { label: "Current Mode", value: "Chat" },
-                  { label: "Steps Taken", value: "4" },
-                  { label: "Last Action", value: "Generate response" },
-                  { label: "Confidence", value: "0.94" },
-                  { label: "Loop Detection", value: "None" },
-                ].map((item) => (
-                  <div key={item.label} className="flex items-center justify-between py-1.5">
-                    <span className="text-xs text-muted-foreground">{item.label}</span>
-                    <span className="text-xs font-medium text-foreground">{item.value}</span>
-                  </div>
-                ))}
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Status</span>
+                  <span className={cn("text-xs font-medium flex items-center", 
+                    error ? "text-red-500" : getStatusColor(health?.llm_available ?? false)
+                  )}>
+                    {getStatusDot(!error && health !== null)}
+                    {error ? "Offline" : health?.status || "Checking..."}
+                  </span>
+                </div>
+                
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">LLM Server</span>
+                  <span className={cn("text-xs font-medium", getStatusColor(health?.llm_available ?? false))}>
+                    {health?.llm_available ? "Connected" : "Disconnected"}
+                  </span>
+                </div>
+                
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Model</span>
+                  <span className="text-xs font-medium text-foreground truncate max-w-[140px]" title={health?.llm_model || health?.model}>
+                    {health?.llm_model || health?.model || "Unknown"}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">LLM URL</span>
+                  <span className="text-xs font-medium text-foreground truncate max-w-[140px]" title={health?.llm_base_url}>
+                    {health?.llm_base_url ? health.llm_base_url.replace("http://", "") : "—"}
+                  </span>
+                </div>
+                
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Model Loaded</span>
+                  <span className={cn("text-xs font-medium", getStatusColor(health?.model_loaded ?? false))}>
+                    {health?.model_loaded ? "Yes" : "No"}
+                  </span>
+                </div>
+                
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Orchestrator</span>
+                  <span className={cn("text-xs font-medium", getStatusColor(health?.orchestrator_ready ?? false))}>
+                    {health?.orchestrator_ready ? "Ready" : "Not Ready"}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Browser</span>
+                  <span className={cn("text-xs font-medium", getStatusColor(health?.browser_ready ?? false))}>
+                    {health?.browser_ready ? "Open" : "Idle"}
+                  </span>
+                </div>
               </div>
+
+              {error && (
+                <div className="mt-3 p-2 rounded bg-red-500/10 border border-red-500/20">
+                  <p className="text-xs text-red-500">
+                    ⚠️ {error}
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Divider */}
             <div className="border-t border-border" />
 
-            {/* Timeline */}
+            {/* Agent Status */}
             <div>
-              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Execution Timeline</h3>
-              <div className="space-y-0">
-                {timelineSteps.map((step, idx) => (
-                  <div key={step.step} className="flex items-start gap-3 py-2">
-                    {/* Vertical line */}
-                    <div className="flex flex-col items-center">
-                      <div className={cn("w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-medium", statusColors[step.status])}>
-                        {step.step}
-                      </div>
-                      {idx < timelineSteps.length - 1 && (
-                        <div className="w-px h-6 bg-border mt-1" />
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-medium text-foreground truncate">{step.action}</span>
-                        <span className="text-[10px] text-muted-foreground ml-2 shrink-0">{step.time}</span>
-                      </div>
-                      <span className={cn("inline-block mt-1 text-[10px] px-1.5 py-0.5 rounded", statusColors[step.status])}>
-                        {step.status}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+              <h4 className="text-xs font-medium text-foreground mb-3">Agent Status</h4>
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Current Mode</span>
+                  <span className="text-xs font-medium text-foreground capitalize">{currentMode}</span>
+                </div>
+                
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Steps Taken</span>
+                  <span className="text-xs font-medium text-foreground">{stepsTaken}</span>
+                </div>
+                
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-xs text-muted-foreground">Last Action</span>
+                  <span className="text-xs font-medium text-foreground truncate max-w-[140px]" title={lastAction}>
+                    {lastAction}
+                  </span>
+                </div>
               </div>
             </div>
+
+            {/* Connection Info */}
+            {health?.timestamp && (
+              <div className="pt-2 border-t border-border">
+                <p className="text-[10px] text-muted-foreground">
+                  Last updated: {new Date(health.timestamp).toLocaleTimeString()}
+                </p>
+              </div>
+            )}
           </div>
         )}
       </aside>

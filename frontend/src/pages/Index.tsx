@@ -49,13 +49,17 @@ const Index = () => {
   const [activeNav, setActiveNav] = useState("chat");
   const [mode, setMode] = useState<"chat" | "controlled" | "autonomous">("chat");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sessionId] = useState(() => crypto.randomUUID());
+  const [stepsTaken, setStepsTaken] = useState(0);
+  const [lastAction, setLastAction] = useState("None");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
 
-  const handleSend = (content: string) => {
+  const handleSend = (content: string, reply: string, currentMode: string) => {
+    // Add user message
     const userMsg: ChatMessageData = {
       id: Date.now().toString(),
       role: "user",
@@ -63,27 +67,19 @@ const Index = () => {
       timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     };
     setMessages((prev) => [...prev, userMsg]);
-    setIsLoading(true);
-
-    // Simulate response
-    setTimeout(() => {
-      const assistantMsg: ChatMessageData = {
-        id: (Date.now() + 1).toString(),
-        role: "assistant",
-        content: `I've received your message: "${content.slice(0, 50)}${content.length > 50 ? "..." : ""}"
-
-I'm processing this in **${mode}** mode. In a production environment, this would connect to the AI backend for real inference.
-
-Key capabilities in this mode:
-- Real-time streaming responses
-- Context-aware conversation memory
-- Tool use and function calling
-- Autonomous task decomposition`,
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
-      setIsLoading(false);
-    }, 1500);
+    
+    // Add assistant message
+    const assistantMsg: ChatMessageData = {
+      id: (Date.now() + 1).toString(),
+      role: "assistant",
+      content: reply,
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    };
+    setMessages((prev) => [...prev, assistantMsg]);
+    
+    // Update telemetry
+    setStepsTaken((prev) => prev + 1);
+    setLastAction(`Responded in ${currentMode} mode`);
   };
 
   return (
@@ -117,11 +113,20 @@ Key capabilities in this mode:
                 <ModeSwitcher mode={mode} onChange={setMode} />
               </div>
             </div>
-            <ChatComposer onSend={handleSend} isLoading={isLoading} />
+            <ChatComposer 
+              onSend={handleSend} 
+              setIsLoading={setIsLoading}
+              isLoading={isLoading}
+              sessionId={sessionId}
+            />
           </div>
 
           {/* Telemetry */}
-          <TelemetryPanel />
+          <TelemetryPanel 
+            currentMode={mode}
+            stepsTaken={stepsTaken}
+            lastAction={lastAction}
+          />
         </div>
       </div>
 

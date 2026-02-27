@@ -21,12 +21,13 @@ class Settings(BaseSettings):
     
     # LLM Configuration
     LLM_BASE_URL: str = "http://localhost:1234/v1"
-    LLM_MODEL: str = "mistral-7b-instruct"
-    LLM_TIMEOUT: int = 60
+    LLM_MODEL: str = "phi-3.1-mini-4k-instruct"
+    LLM_TIMEOUT: int = 120
     LLM_TEMPERATURE: float = 0.7
-    
+    LLM_MAX_TOKENS: int = 256
+
     # Browser Configuration
-    BROWSER_HEADLESS: bool = True
+    BROWSER_HEADLESS: bool = False
     BROWSER_TIMEOUT_MS: int = 30000
     BROWSER_AUTO_RETRY: bool = True
     

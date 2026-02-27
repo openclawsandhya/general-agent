@@ -14,7 +14,9 @@ class IntentType(str, Enum):
 
 
 class ActionType(str, Enum):
-    """Supported browser automation actions."""
+    """Supported agent actions — browser, filesystem, code, and web research."""
+
+    # ---- Browser Automation ----
     OPEN_URL = "open_url"
     SEARCH = "search"
     CLICK = "click"
@@ -23,6 +25,24 @@ class ActionType(str, Enum):
     WAIT = "wait"
     FILL_INPUT = "fill_input"
     NAVIGATE_BACK = "navigate_back"
+    TYPE = "type"                       # alias for fill_input (SANDHYA spec)
+    EXTRACT_CONTENT = "extract_content" # web-based content extraction
+    PRESS_KEY = "press_key"             # keyboard key press (Enter, Escape…)
+    GET_PAGE_INFO = "get_page_info"     # get current URL + title
+    SCREENSHOT = "screenshot"           # capture full-page screenshot
+
+    # ---- File System ----
+    CREATE_FILE = "create_file"
+    READ_FILE = "read_file"
+    LIST_FILES = "list_files"
+    DELETE_FILE = "delete_file"
+
+    # ---- Code Execution ----
+    RUN_PYTHON = "run_python"
+    RUN_SHELL = "run_shell"
+
+    # ---- Web Research ----
+    SEARCH_WEB = "search_web"
 
 
 class ActionStep(BaseModel):
@@ -101,3 +121,69 @@ class AgentConfig(BaseModel):
         default=True,
         description="Run browser in headless mode"
     )
+
+
+class ExecutionReport(BaseModel):
+    """Report of an automation execution."""
+    success: bool
+    steps_completed: int
+    total_steps: int
+    execution_message: str
+    reasoning: str
+    details: Optional[str] = None
+
+
+# ============================================================================
+# SANDHYA.AI Autonomous Goal Models
+# ============================================================================
+
+class GoalStep(BaseModel):
+    """
+    A single step in a SANDHYA.AI autonomous goal plan.
+
+    Format matches the system prompt JSON spec:
+      {"step": 1, "action": "tool_name", "parameters": {...}}
+    """
+    step: int = Field(1, description="Step number")
+    action: str = Field(..., description="Tool name to execute")
+    parameters: dict = Field(default_factory=dict, description="Tool parameters")
+    description: Optional[str] = Field(None, description="Human-readable step description")
+
+    class Config:
+        extra = "allow"
+
+
+class GoalPlan(BaseModel):
+    """
+    A structured autonomous execution plan returned by the GoalPlanner.
+
+    Generated from SANDHYA_SYSTEM_PROMPT responses.
+    Supports new deliberation format (planner→critic→refiner) as well as
+    legacy format (flat 'plan' key).
+    """
+    mode: str = Field("controlled_automation", description="chat | controlled_automation")
+    goal: str = Field("", description="Interpreted user goal")
+    plan: List[GoalStep] = Field(default_factory=list, description="Ordered execution steps (final)")
+    message: str = Field("", description="User-friendly plan summary")
+    deliberation: Optional[dict] = Field(
+        None,
+        description="Multi-agent deliberation payload: planner_plan, critic_feedback, refined_plan"
+    )
+
+    class Config:
+        extra = "allow"
+
+
+class AutonomousRunReport(BaseModel):
+    """Final report after an autonomous goal execution loop."""
+    goal: str
+    mode: str
+    completed: bool
+    iterations: int
+    steps_executed: int
+    final_message: str
+    validation_reason: str = ""
+    task_id: str = ""
+
+    class Config:
+        use_enum_values = True

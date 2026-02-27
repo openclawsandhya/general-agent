@@ -1,5 +1,5 @@
 """Models package."""
-from models.schemas import (
+from .schemas import (
     IntentType,
     ActionType,
     ActionStep,
@@ -8,6 +8,7 @@ from models.schemas import (
     MessageResponse,
     StreamingMessage,
     AgentConfig,
+    ExecutionReport,
 )
 
 __all__ = [
@@ -18,5 +19,7 @@ __all__ = [
     "MessageRequest",
     "MessageResponse",
     "StreamingMessage",
+    "AgentConfig",
+    "ExecutionReport",
     "AgentConfig",
 ]

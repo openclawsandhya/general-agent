@@ -40,21 +40,23 @@ class BrowserController:
         self.page: Optional[Page] = None
         self.context: Optional[BrowserContext] = None
         self.browser: Optional[Browser] = None
-        
+        self._playwright = None
+
         logger.info(f"BrowserController initialized (headless={headless})")
     
     async def start(self) -> None:
         """Start the browser."""
         try:
-            playwright = await async_playwright().start()
-            self.browser = await playwright.chromium.launch(
-                headless=self.headless
+            self._playwright = await async_playwright().start()
+            self.browser = await self._playwright.chromium.launch(
+                headless=self.headless,
+                args=["--start-maximized"],
             )
             self.context = await self.browser.new_context()
             self.page = await self.context.new_page()
             self.page.set_default_timeout(self.timeout_ms)
-            
-            logger.info("Browser started successfully")
+
+            logger.info(f"Browser started (headless={self.headless})")
         except Exception as e:
             logger.error(f"Failed to start browser: {e}")
             raise
@@ -68,11 +70,23 @@ class BrowserController:
                 await self.context.close()
             if self.browser:
                 await self.browser.close()
-            
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
+            self.page = None
+            self.context = None
+            self.browser = None
+
             logger.info("Browser stopped successfully")
         except Exception as e:
             logger.error(f"Error stopping browser: {e}")
     
+    async def ensure_started(self) -> None:
+        """Lazily start browser on first use — singleton, reused across all requests."""
+        if self.page is None:
+            logger.info("[BrowserController] Auto-starting browser (lazy init)...")
+            await self.start()
+
     async def open_url(self, url: str) -> str:
         """
         Open a URL in the browser.
@@ -83,8 +97,7 @@ class BrowserController:
         Returns:
             Success message
         """
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         
         try:
             if not url.startswith(("http://", "https://")):
@@ -152,8 +165,7 @@ class BrowserController:
         Returns:
             Success message
         """
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         
         try:
             logger.info(f"Clicking element: {selector}")
@@ -207,8 +219,7 @@ class BrowserController:
         Returns:
             Success message
         """
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         
         try:
             logger.info(f"Scrolling {direction} {amount} times")
@@ -239,8 +250,7 @@ class BrowserController:
         Returns:
             Extracted text
         """
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         
         try:
             if selector:
@@ -269,8 +279,7 @@ class BrowserController:
         Returns:
             Success message
         """
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         
         try:
             logger.info(f"Filling input {selector} with value: {value}")
@@ -299,8 +308,7 @@ class BrowserController:
     
     async def navigate_back(self) -> str:
         """Navigate back in browser history."""
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         
         try:
             logger.info("Navigating back")
@@ -313,12 +321,10 @@ class BrowserController:
     
     async def get_current_url(self) -> str:
         """Get current page URL."""
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         return self.page.url
     
     async def get_title(self) -> str:
         """Get current page title."""
-        if not self.page:
-            raise RuntimeError("Browser not started. Call start() first.")
+        await self.ensure_started()
         return await self.page.title()
